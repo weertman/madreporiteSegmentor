@@ -90,7 +90,7 @@ def create_model_from_config(config_dict: dict, model_path: Path, device: torch.
 
     model.to(device)
     # Load weights
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint)
     model.eval()
 
@@ -182,19 +182,139 @@ class InferenceSession:
             return self._batch_inference(frame_arrays)
         else:
             # 'inputs' is a list of images (paths or arrays)
-            # We'll unify them into a list of np arrays
             image_arrays = []
             for inp in inputs:
                 img_np = self._load_image_array(inp)
                 image_arrays.append(img_np)
             return self._batch_inference(image_arrays)
 
+    # -------------------------------------------------------------------------
+    # NEW METHODS FOR TWO-PASS REFINEMENT
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _find_center_of_largest_cc(mask: np.ndarray) -> tuple:
+        """
+        Find the center of the largest connected component in a 2D {0,1} mask.
+        Returns (row, col). If no foreground, returns the image center.
+        """
+        mask_binary = (mask > 0).astype(np.uint8)
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask_binary, connectivity=8)
+        if num_labels <= 1:
+            # No foreground => fallback to image center
+            return (mask.shape[0] // 2, mask.shape[1] // 2)
+
+        largest_area = 0
+        largest_label = 1
+        for label in range(1, num_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area > largest_area:
+                largest_area = area
+                largest_label = label
+
+        cx, cy = centroids[largest_label]  # (x, y)
+        return (int(cy), int(cx))  # (row, col)
+
+    @staticmethod
+    def _keep_largest_cc(mask: np.ndarray) -> np.ndarray:
+        """
+        Keep only the largest connected component in a 2D {0,1} mask,
+        returning a {0,1} mask of the same shape.
+        """
+        mask_binary = (mask > 0).astype(np.uint8)
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask_binary, connectivity=8)
+        if num_labels <= 1:
+            return np.zeros_like(mask, dtype=mask.dtype)
+
+        largest_area = 0
+        largest_label = 1
+        for label in range(1, num_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area > largest_area:
+                largest_area = area
+                largest_label = label
+
+        out_mask = np.zeros_like(mask_binary, dtype=mask_binary.dtype)
+        out_mask[labels_im == largest_label] = 1
+        return out_mask.astype(mask.dtype)
+
+    def predict_image_with_refinement(self, image_input, refinement_ratio=0.2268, threshold=None) -> np.ndarray:
+        """
+        Two-pass inference:
+          1) Predict entire image => binarize with threshold
+          2) Find largest CC center, crop around it by refinement_ratio
+          3) Second pass on subregion => threshold
+          4) Keep largest CC in subregion
+          5) Resize subregion's refined mask back and paste into a mask the size of the original
+
+        Returns a 2D np.array {0,1} matching the original image shape.
+        """
+        if threshold is None:
+            threshold = self.threshold
+
+        # Load full image (RGB or BGR; we assume it's consistent with .predict_image)
+        img_np = self._load_image_array(image_input)
+        h, w = img_np.shape[:2]
+
+        # First-pass inference (mask is 0/1 at model's input_size, then scaled if needed).
+        first_pass_mask = self.predict_image(img_np)  # shape might be ~ the model's input, but returned as 0/1
+        # If needed, you could do direct transform logic here, but using .predict_image is simpler.
+
+        # Find center of largest CC in the full-res mask
+        # Because .predict_image might have returned exactly the model's input-size mask,
+        # we assume the transform un-distorted it to (h, w).
+        # If the model's input_shape differs from your original, you can do an explicit resize.
+        # But in this pipeline, we typically keep model_input_shape == original shape or do a known ratio.
+
+        # For safety, let's ensure the mask is the same size as original (h, w) if needed:
+        if first_pass_mask.shape[0] != h or first_pass_mask.shape[1] != w:
+            first_pass_mask = cv2.resize(first_pass_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        center = self._find_center_of_largest_cc(first_pass_mask)
+
+        # Crop bounds
+        half_crop_w = int(w * refinement_ratio / 2)
+        half_crop_h = int(h * refinement_ratio / 2)
+
+        x0 = center[1] - half_crop_w
+        x1 = center[1] + half_crop_w
+        y0 = center[0] - half_crop_h
+        y1 = center[0] + half_crop_h
+
+        # Clamp to edges
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(w, x1)
+        y1 = min(h, y1)
+
+        # Second pass: predict on cropped subregion
+        sub_image = img_np[y0:y1, x0:x1]
+        sub_mask = self.predict_image(sub_image)
+        # If needed, ensure sub_mask is also sub_image's shape => typically yes.
+
+        # Keep largest CC in subregion
+        sub_mask = self._keep_largest_cc(sub_mask)
+
+        # Resize sub_mask to exactly the subregion size in case the model transform changed it
+        cropW = (x1 - x0)
+        cropH = (y1 - y0)
+        if sub_mask.shape[0] != cropH or sub_mask.shape[1] != cropW:
+            sub_mask = cv2.resize(sub_mask, (cropW, cropH), interpolation=cv2.INTER_NEAREST)
+
+        # Paste sub_mask into a black mask of the full size
+        refined_mask = np.zeros((h, w), dtype=np.uint8)
+        refined_mask[y0:y1, x0:x1] = sub_mask
+
+        return refined_mask
+
     # -------------------------------------------------
     # INTERNAL UTILS
     # -------------------------------------------------
 
     def _load_image_array(self, image_input):
-        """Load a single image as a np.array, from either a path or direct array."""
+        """
+        Load a single image as a np.array, from either a path or direct array.
+        """
         if isinstance(image_input, (str, Path)):
             # read from file
             img_path = Path(image_input)
@@ -207,7 +327,10 @@ class InferenceSession:
             raise TypeError("image_input must be path-like or a np.ndarray")
 
     def _transform_one(self, img_np):
-        """Apply Albumentations transform to a single image array, return a (1, C, H, W) tensor."""
+        """
+        Apply Albumentations transform to a single image array,
+        return a (1, C, H, W) tensor.
+        """
         transformed = self.transform(image=img_np)
         img_tensor = transformed["image"].unsqueeze(0).to(self.device)  # (1,C,H,W)
         return img_tensor
@@ -238,7 +361,10 @@ class InferenceSession:
         return [m[1] for m in masks_sorted]  # strip index, keep mask
 
     def _run_batch(self, batch_buffer):
-        """Run inference on a batch of images stored as (index, np.array). Returns list of (index, mask)."""
+        """
+        Run inference on a batch of images stored as (index, np.array).
+        Returns list of (index, mask).
+        """
         # 1) transform all
         tensors = []
         idxes = []
@@ -264,9 +390,11 @@ class InferenceSession:
 
     def _read_video_frames(self, video_path):
         """
-        Read frames from a video file using OpenCV, returning a list of np arrays (BGR).
-        We can convert to RGB if desired. For large videos, you might want to
-        process them in streaming fashion instead of loading them all into memory!
+        Read frames from a video file using OpenCV,
+        returning a list of np arrays (BGR).
+        We can convert to RGB if needed. For large videos,
+        you might want to process them in streaming fashion
+        instead of loading them all into memory!
         """
         video_path = str(video_path)
         cap = cv2.VideoCapture(video_path)
